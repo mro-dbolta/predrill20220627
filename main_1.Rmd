@@ -1,0 +1,1684 @@
+
+
+```{r global variables}
+### handle linux runs
+if (.Platform$OS.type != "windows") setwd("/data/advancedanalytics/public_data_runs/0_orchestration")
+
+libraries_to_load = read.csv("config_files/libraries_to_load.csv", stringsAsFactors = FALSE)$libraries
+
+files_to_source = read.csv("config_files/files_to_source.csv", stringsAsFactors = FALSE)$files_to_source
+
+
+WPS_distances = c("1MILE", "2MILES")
+
+sujan_data_files = 
+  c("EAGLEFORD_IHS_Prod_FlatTable.csv",
+    
+    "volumes\\EAGLEFORD_INTEGRATED_VOLUMES_PDAYS.csv",
+    "volumes\\EAGLEFORD_INTEGRATED_VOLUMES_PDAYS_5YEARS_PIVOT.csv",
+    "volumes\\PROCOUNT_DAILY_VOLUMES_PDAYS.csv",
+    "volumes\\PROCOUNT_MONTHLY_VOLUMES_PDAYS.csv",
+    "volumes\\ES_PDP_VOLUMES_PDAYS.csv",
+    "volumes\\ES_POD_VOLUMES_PDAYS.csv",
+    
+    # "wellspacing\\EAGLEFORD_720_WELLSPACING.csv",
+    "wellspacing\\EAGLEFORD_WELLSPACING.csv",
+    paste0("wellspacing\\EAGLEFORD_WPS_TIMESERIES_", WPS_distances[1], ".csv"),
+    paste0("wellspacing\\EAGLEFORD_WPS_TIMESERIES_", WPS_distances[2], ".csv")
+    
+  )
+
+```
+
+```{r load all functions and libraries}
+
+### defensive
+if (anyDuplicated(files_to_source) > 0) stop(paste0("files_to_source contains duplicate calls at ", anyDuplicated(files_to_source)))
+
+invisible(sapply(files_to_source, source, .GlobalEnv))
+
+# load libraries
+install_load_libraries_strings(libraries_to_load)
+
+```
+
+```{r initial setup on Zbook}
+
+### move sujan data files in
+# create_sujan_data_files.R
+create_sujan_data_files(sujan_data_files, 
+                        target_directory = "..\\1_base_Sujan_data",
+                        run_if = F)
+
+fix_OTH_VOLUMES_SOURCE(flat_file_csv_path = "../1_base_Sujan_data/EAGLEFORD_IHS_Prod_FlatTable.csv",
+                       run_if = F)
+
+### create pivoted WPS table
+create_pivoted_WPS =
+  function(run_if){
+    if (run_if) {
+      map(1:2,
+          function(i){
+            tall_WPS_filenames = c(paste0("EAGLEFORD_WPS_TIMESERIES_", WPS_distances[1], ".csv"),
+                                   paste0("EAGLEFORD_WPS_TIMESERIES_", WPS_distances[2], ".csv"))
+            well_density_distances = WPS_distances
+            
+            pivot_Sujan_WPS_wide(
+              tall_WPS_filename = tall_WPS_filenames[i],
+              tall_WPS_file_locn = "../1_base_Sujan_data/",
+              well_density_distance = well_density_distances[i]
+            )      
+          })      
+    }
+  }
+create_pivoted_WPS(run_if = F)
+
+### create imputed geology file
+# create_imputed_geology.R
+create_imputed_geology(flat_file_name = sujan_data_files[1],
+                       specific_columns_config_locn = "config_files/1_geo features to remove at impute.xlsx",
+                       well_density_data_locns =
+                         c(paste0("../1_base_Sujan_data/EAGLEFORD_WPS_TIMESERIES_PIVOT_WIDE_", WPS_distances[1], ".csv"),
+                           paste0("../1_base_Sujan_data/EAGLEFORD_WPS_TIMESERIES_PIVOT_WIDE_", WPS_distances[2], ".csv")),
+                       cleanup_PP_0_wellcount = TRUE, # don't use Sujan's map impute on PP vars
+                       impute_PP = TRUE, # fill PP with -100 placeholder
+                       impute_DP_TVD_SS = TRUE,
+                       run_if = F)
+
+### run /IHS autodecline/fit IHS decline 2 integrated data.ipynb on EAGLEFORD_INTEGRATED_VOLUMES_PDAYS.csv
+### run the fits in AWS, download chunks back to multiple_csvs_location 
+### run AWS on EAGLEFORD_INTEGRATED_VOLUMES_PDAYS.csv
+# create_AWS_arps_folders(target_main_directory = "..\\3_AWS_arps_declines",
+#                         run_if = FALSE)
+create_AWS_arps_folders(target_main_directory = "../3_AWS_arps_declines",
+                        run_if = F)
+
+### run on hpc
+run_Arps_declines(
+  prod_data_locn = "../1_base_Sujan_data/EAGLEFORD_INTEGRATED_VOLUMES_PDAYS.csv",
+  output_folder = "../3_AWS_arps_declines",
+  run_if = F)
+
+# merge_and_calc_best_from_AWS_arps_fit.R
+merge_and_calc_best_from_AWS_arps_fit(
+  multiple_csvs_location = "../3_AWS_arps_declines/sagemaker_results",
+  multiple_csvs_output_location = "../3_AWS_arps_declines/all_wells_arps_grid_results_oil.csv",
+  best_arps_per_well_output_location = "../3_AWS_arps_declines/best_arps_per_well_results_oil.csv",
+  merge_csvs = FALSE, ### don't need this true if results from hpc
+  recalc_best_arps_per_well = F)
+
+### impute_fcasts_into_production.R
+impute_fcasts_into_production(dca_output_target_directory = "4_dca_output", 
+                              run_if = F)
+
+### prep for second round of aws
+### some ES wells not out to 40 years
+### send this file to sagemaker: 5_AWS_enersite_declines/sagemaker_input/wells_without_full_duration.csv
+prepare_data_for_AWS(path_to_initial_decline_data = "../4_dca_output/all_wells_oil_actuals_with_fcasts.csv",
+                     run_if = F)
+
+### decline enersite wells
+### run on Zbook
+run_Arps_declines_on_ES(
+  prod_data_locn = "../5_AWS_enersite_declines/sagemaker_input/wells_without_full_duration.csv",
+  output_folder = "../5_AWS_enersite_declines/sagemaker_results",
+  run_if = F)
+
+### repeat processing for AWS-run-on-ES-wells results
+merge_and_calc_best_from_AWS_arps_fit(
+  #multiple_csvs_location = "../5_AWS_enersite_declines/sagemaker_results",
+  multiple_csvs_output_location = "../5_AWS_enersite_declines/sagemaker_results/ES_wells_arps_grid_results_oil.csv",
+  best_arps_per_well_output_location = "../5_AWS_enersite_declines/sagemaker_results/best_arps_per_ES_well_results_oil.csv",
+  #merge_csvs = FALSE,
+  recalc_best_arps_per_well = F)
+
+### create full production files
+### 5_AWS_enersite_declines/final_data_all_at_40_yrs_5_YEARS_PIVOT.csv
+impute_ES_fcasts_into_production(
+  previous_integrated_prod_data_location = "../4_dca_output/all_wells_oil_actuals_with_fcasts.csv",
+  ES_declines_data_location = paste0("../5_AWS_enersite_declines/",
+                                     "sagemaker_results/",
+                                     "best_arps_per_ES_well_results_oil.csv"),
+  dca_output_target_directory = "../5_AWS_enersite_declines",
+  run_if = F)
+
+test_check_14400_production_completeness(
+  production_file_location = "../5_AWS_enersite_declines/final_data_all_at_40_yrs_5_YEARS_PIVOT.csv",
+  run_if = F)
+
+
+### setup raw data for modeling and depletion maps, include 5 and 10 year liquid columns
+create_initial_data_for_modeling(header_data_locn = "../2_geo_impute/EAGLEFORD_IHS_Prod_FlatTable_2_geo_imputed.csv",
+                                 prod_pivot_data_locn = "../5_AWS_enersite_declines/final_data_all_at_40_yrs_5_10_20_YEARS_PIVOT.csv",
+                                 days_actual_history_locn = "../4_dca_output/days_actual_history.csv",
+                                 new_folder_locn = "../6_data_for_modeling/",
+                                 columns_to_exclude_locn = "config_files/2_useless_columns_to_exclude_from_initial_modeling_data.csv",
+                                 impute_LOC_STATE_NAME = TRUE,
+                                 run_post_diagnostic_tests = TRUE,
+                                 run_if = F)
+
+### setup for AWS task to find min distance from each point on grid to set of well locations
+create_grid_for_liquid_depletion_map_for_AWS(
+  input_header_locn = "../6_data_for_modeling/header_and_production_combined.csv",
+  output_directory = "7_depletion_maps",
+  feet_between_points_on_well = 100L,
+  run_if = F)
+
+### can run this on hpc instead of AWS function referenced below 
+# depletion map support/v6_use function 1.ipynb
+# data in ../7_depletion_maps/data_to_send_to_AWS/
+get_min_distance_for_depln(
+  initial_rectangular_grid_locn = "../7_depletion_maps/data_to_send_to_AWS/initial_rectangular_grid.csv",
+  well_location_data_locn = "../7_depletion_maps/data_to_send_to_AWS/well_location_data.csv",
+  output_folder = "../7_depletion_maps/data_received_back_from_AWS",
+  run_if = F)
+
+
+### run after AWS finished
+merge_csvs_in_folder(input_files_location = "../7_depletion_maps/data_received_back_from_AWS", 
+                     output_location_and_filename = "../7_depletion_maps/data received back from AWS merged.csv",
+                     run_if = F)
+
+### filter grid to those near wells, 
+### get all wells associated with a given grid point
+### takes ~6 hours to run, uses all cpu's on Z book
+get_wells_associated_with_grid_pts(
+  input_actual_production_locn = "../1_base_Sujan_data/EAGLEFORD_INTEGRATED_VOLUMES_PDAYS.csv",
+  main_depletion_directory = "../7_depletion_maps",
+  output_filename = "wells_associated_with_grid_pts.csv",
+  run_if = F)
+
+### create depletion maps
+create_depletion_and_pseudo_recovery_factor_maps(
+  depletion_maps_folder = "../7_depletion_maps/",
+  run_if = F)
+
+### create well sticks spatial data frame
+# throws a "NAs introduced by coercion" warning from spatial_lines_list
+# when it gets written to disk
+create_wells_as_a_spatial_lines_df(
+  data_for_shape_file_locn = "../1_base_Sujan_data/EAGLEFORD_IHS_Prod_FlatTable.csv",
+  output_locn = "../7_depletion_maps/",
+  run_if = F)
+
+### manually create spotfire of depletion map
+```
+
+```{r functions 2 thru inference data setup}
+### final cleanup and build train & test sets
+build_train_test_splits(
+  train_test_splits_config_file_locn = "config_files/4_preprocessing_and_train_test_splits.csv",
+  input_whole_data_for_modeling_locn = "../6_data_for_modeling/header_and_production_EF_in_Texas_only.csv",
+  output_folder_locn = "../8_train_test_full_datasets",
+  run_if = F)
+
+### create GCM's
+create_GCMs_1 =
+  function(run_if){
+    if (run_if) {
+      map(
+        1:2,
+        function(i){
+          create_GCM(
+            input_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_whole.csv",
+            output_folder_locn = "../9_GCM",
+            output_file_descriptor = c("1_no_depln_vars","2_with_depln")[i],
+            include_depletion = c(FALSE, TRUE)[i],
+            run_if = run_if)})      
+    }
+  } 
+create_GCMs_1(run_if = F)
+
+
+### create 3rd GCM with alternative completion
+create_GCMs_3 =
+  function(run_if){
+    if (run_if) {
+      map(
+        1:2,
+        function(i){
+          create_GCM(
+            input_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_whole.csv",
+            output_folder_locn = "../9_GCM/",
+            output_file_descriptor = c("3a_no_depln_vars_3000ppf","3b_with_depln_3000ppf")[i],
+            standard_ppf = 3000,
+            standard_bpf = 34/2500*3000,
+            include_depletion = c(FALSE, TRUE)[i],
+            run_if = run_if)})      
+    }
+  }
+create_GCMs_3(run_if = F)
+
+create_GCMs_3b =
+  function(run_if){
+    if (run_if) {
+      map(
+        1:1,
+        function(i){
+          create_GCM(
+            input_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_whole.csv",
+            output_folder_locn = "../9_GCM/",
+            output_file_descriptor = c("4a_no_depln_2000ppf")[i],
+            standard_ppf = 2000,
+            standard_bpf = 34/2500*2000,
+            include_depletion = c(FALSE)[i],
+            run_if = run_if)})      
+    }
+  }
+create_GCMs_3b(run_if = F)
+
+create_GCMs_3c =
+  function(run_if){
+    if (run_if) {
+      map(
+        1:1,
+        function(i){
+          create_GCM(
+            input_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_whole.csv",
+            output_folder_locn = "../9_GCM/",
+            output_file_descriptor = c("4b_with_depln_2000ppf")[i],
+            standard_ppf = 2000,
+            standard_bpf = 34/2500*2000,
+            include_depletion = c(TRUE)[i],
+            run_if = run_if)})      
+    }
+  }
+create_GCMs_3c(run_if = F)
+
+### create GCM's with specific columns
+### no dpl, no XY's, yes WS, no DIGEO
+GCM_input_variables = read.csv("config_files/GCM_input_variables.csv", stringsAsFactors = F)$GCM_input_variables
+
+create_GCM(
+  input_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_whole.csv",
+  output_folder_locn = "../9_GCM",
+  output_file_descriptor = c("5a_MRO_maps_2000ppf"),
+  standard_ppf = 2000,
+  standard_bpf = 34/2500*2000,
+  include_depletion = c(FALSE),
+  input_variables = GCM_input_variables,
+  output_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = F)
+
+create_GCM(
+  input_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_whole.csv",
+  output_folder_locn = "../9_GCM",
+  output_file_descriptor = c("5b_MRO_maps_2500ppf"),
+  standard_ppf = 2500,
+  standard_bpf = 34,
+  include_depletion = c(FALSE),
+  input_variables = GCM_input_variables,
+  output_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = F)
+
+create_GCM(
+  input_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_whole.csv",
+  output_folder_locn = "../9_GCM",
+  output_file_descriptor = c("5c_MRO_maps_3000ppf"),
+  standard_ppf = 3000,
+  standard_bpf = 34 / 2500 * 3000,
+  include_depletion = c(FALSE),
+  input_variables = GCM_input_variables,
+  output_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = F)
+
+### manually create GCM dxp's
+
+### Add GCM columns back to train & test data
+GCM_map =
+  function(run_if){
+    if (run_if) {
+      map(
+        c(
+          ### with_10_20_year_columns
+          "../8_train_test_full_datasets/1_MRO_2019_later_val_test.csv",
+          "../8_train_test_full_datasets/1_MRO_2019_later_val_train.csv",
+          "../8_train_test_full_datasets/1_MRO_2019_later_val_whole.csv",
+          "../8_train_test_full_datasets/2_all_operators_2019_later_val_test.csv",
+          "../8_train_test_full_datasets/2_all_operators_2019_later_val_train.csv",
+          "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole.csv",
+          "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test.csv",
+          "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train.csv",
+          "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_whole.csv",
+          "../8_train_test_full_datasets/4_MRO_redevs_in_val_test.csv",
+          "../8_train_test_full_datasets/4_MRO_redevs_in_val_train.csv",
+          "../8_train_test_full_datasets/4_MRO_redevs_in_val_whole.csv"),
+        function(well_data_file){
+          add_GCM_to_well_data(
+            GCM_locn_and_filename = "../9_GCM/GCM_2_with_depln.csv",
+            GCM_source_column_names = c("LIQUID_360", 
+                                        "LIQUID_720"),
+            well_data_locn_and_filename = well_data_file,
+            append_output_filename = "_add_GCM",
+            prepend_column_names = "GCM_", # string to append to front of GCM columns in new data
+            linear_or_kknn = "kknn",
+            run_if = run_if)
+          
+          print(paste0(well_data_file,
+                       " complete"))
+        })
+    }
+  }
+GCM_map(run_if = F)
+
+### create one-off train and test sets
+###max values in train
+maximize_output_data(
+  input_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  output_filename = "2b_GCM_test_output_columns_maxed.csv",
+  run_if = F)
+
+maximize_output_data(
+  input_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  output_filename = "3b_GCM_test_output_columns_maxed.csv",
+  run_if = F)
+
+marathon_spacing_pilots_in_test(
+  input_whole_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole_add_GCM.csv",
+  output_filename_stub = "2c_spacing_analogs_holdout",
+  spacing_analogs_config_locn = "config_files/20_40_acre_apis.xlsx",
+  run_if = F)
+
+marathon_spacing_pilots_in_test(
+  input_whole_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_whole_add_GCM.csv",
+  output_filename_stub = "3c_MRO_ONLY_spacing_analogs_holdout",
+  spacing_analogs_config_locn = "config_files/20_40_acre_apis.xlsx",
+  MRO_only = TRUE,
+  run_if = F)
+
+### Inference data sets
+create_inference_data(
+  initial_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole_add_GCM.csv",
+  inference_data_folder_locn = "../11_inference_data_sets/",
+  output_filenames =
+    c("BASE_PLAN_sensitivity",
+      "PPF_sensitivity",
+      "BPF_sensitivity"),
+  inference_data_prep_function_locn =
+    c("anonymous_support_functions/_create_inference_data_set.base_plan_1.R",
+      "anonymous_support_functions/_create_inference_data_set.ppf_sensitivity_1.R",
+      "anonymous_support_functions/_create_inference_data_set.BPF_sensitivity_1b_corrected_barrels.R"),
+  run_if = F)
+
+create_inference_data( ### fewer rows
+  initial_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole_add_GCM.csv",
+  inference_data_folder_locn = "../11_inference_data_sets/",
+  output_filenames =
+    c("BASE_PLAN_MRO_only",
+      "PPF_MRO_only",
+      "BPF_MRO_only"),
+  inference_data_prep_function_locn =
+    c("anonymous_support_functions/_create_inference_data_set.base_plan_2_MRO_only.R",
+      "anonymous_support_functions/_create_inference_data_set.ppf_sensitivity_2_MRO_only.R",
+      "anonymous_support_functions/_create_inference_data_set.BPF_sensitivity_2_MRO_only.R"),
+  run_if = F)
+
+create_inference_data( ### fewer rows
+  initial_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole_add_GCM.csv",
+  inference_data_folder_locn = "../11_inference_data_sets/",
+  output_filenames =
+    c("BASE_PLAN_MRO_only",
+      "PPF_MRO_only",
+      "BPF_MRO_only",
+      "ACRES_MRO_only"),
+  inference_data_prep_function_locn =
+    c("anonymous_support_functions/_create_inference_data_set.base_plan_2_MRO_only.R",
+      "anonymous_support_functions/_create_inference_data_set.ppf_sensitivity_2_MRO_only.R",
+      "anonymous_support_functions/_create_inference_data_set.BPF_sensitivity_2_MRO_only.R",
+      "anonymous_support_functions/_create_inference_data_set.spacing_2_MRO_only.R"),
+  run_if = F)
+
+### inference sets location settings
+inference_data_locns_more_timesteps =
+  inference_data_locns = c("../11_inference_data_sets/BASE_PLAN_sensitivity.csv",
+                           "../11_inference_data_sets/BPF_sensitivity.csv",
+                           "../11_inference_data_sets/PPF_sensitivity.csv")
+
+MRO_only_inference_data_locns = c("../11_inference_data_sets/BASE_PLAN_MRO_only.csv",
+                             "../11_inference_data_sets/PPF_MRO_only.csv",
+                             "../11_inference_data_sets/BPF_MRO_only.csv",
+                             "../11_inference_data_sets/ACRES_MRO_only.csv")
+
+```
+
+```{r models}
+dir.create("../10_modeling/", showWarnings = FALSE)
+
+### MRO 2019+ in val, all else in train
+### no PP vars
+dir.create("../10_modeling/run_1_swor", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_1_swor",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 1,
+  run_if = F)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_1_swor",
+  train_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_test_add_GCM.csv",
+  manually_picked_size = 14,
+  manually_pick_graph_extents = list(xlim = c(0, 30), ylim = c(0.1, 0.4)),
+  run_if = F) 
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_1_swor",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = F)
+
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_1_swor",
+  train_or_test_rank = "test",
+  manually_picked_rank = 19,
+  manually_pick_graph_extents = list(xlim = c(10, 20), ylim = c(0, 0.15)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_1_swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  SAMPTYPE = "swor",
+  retrain_main_model = TRUE,
+  train_quantile_regression_model = F,
+  build_out_of_train_predictions = F,
+  build_shapley_object = F,
+  run_shap_on_train = F,
+  # number_shaps_to_calc = 1000L,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_1_swor/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_1_swor/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_1_swor/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_1_swor/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_1_swor/", 
+  quantile_predictions_locn = "../10_modeling/run_1_swor/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+create_final_GCM(
+  sample_inference_data_locn = "../11_inference_data_sets/BASE_PLAN_sensitivity.csv",
+  rfsrc_model_locn = "../10_modeling/run_1_swor/final_model.rds",
+  old_GCM_locn = "../9_GCM/GCM_2_with_depln.csv",
+  output_locn = "../10_modeling/run_1_swor/",
+  parent_data_config_locn = "config_files/final_GCM_parent_assumptions.xlsx",
+  run_if = F)
+
+################################################
+### model 2
+### first model with PP variables
+dir.create("../10_modeling/run_2_with_prod_potential", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_2_with_prod_potential",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 2,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_2_with_prod_potential",
+  train_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_test_add_GCM.csv",
+  manually_pick_graph_extents = list(xlim = c(0, 50), ylim = c(0.12,0.35)),
+  manually_picked_size = NULL,
+  run_if = F) 
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_2_with_prod_potential",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_2_with_prod_potential",
+  train_or_test_rank = "test",
+  manually_picked_rank = 65,
+  manually_pick_graph_extents = list(xlim = c(50, 75), ylim = c(0,0.2)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/1_MRO_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_2_with_prod_potential",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = TRUE,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = FALSE,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_2_with_prod_potential/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data( ### takes 3 hours on zbook
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_2_with_prod_potential/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_2_with_prod_potential/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_2_with_prod_potential/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_2_with_prod_potential/", 
+  quantile_predictions_locn = "../10_modeling/run_2_with_prod_potential/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+################################################
+### model 3
+### all operators both tr & ts, 2019+ in val, 2018- in train
+### no PP vars
+### swor
+dir.create("../10_modeling/run_3_no_prod_pot_all_operators_in_val", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 1,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_3_no_prod_pot_all_operators_in_val",
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  manually_picked_size = 15,
+  manually_pick_graph_extents = list(xlim = c(0, 30), ylim = c(0.2,0.35)),
+  run_if = F) 
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val",
+  train_or_test_rank = "test",
+  manually_picked_rank = 171,
+  manually_pick_graph_extents = list(xlim = c(170, 175), ylim = c(0.2,0.35)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  SAMPTYPE = "swor",
+  retrain_main_model = F,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = FALSE,
+  build_shapley_object = T,
+  run_shap_on_train = T,
+  number_shaps_to_calc = 100,
+  run_if = F)
+  
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_3_no_prod_pot_all_operators_in_val/", 
+  quantile_predictions_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+create_final_GCM(
+  sample_inference_data_locn = "../11_inference_data_sets/BASE_PLAN_sensitivity.csv",
+  rfsrc_model_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val/final_model.rds",
+  output_locn = "../10_modeling/run_3_no_prod_pot_all_operators_in_val/",
+  parent_data_config_locn = "config_files/final_GCM_parent_assumptions.xlsx",
+  run_if = F)
+
+
+################################################
+### model 4
+### third model with PP vars
+dir.create("../10_modeling/run_4_with_prod_pot_all_operators_in_val", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_4_with_prod_pot_all_operators_in_val",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 2,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_4_with_prod_pot_all_operators_in_val",
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  manually_picked_size = 25,
+  manually_pick_graph_extents = list(xlim = c(0, 50), ylim = c(0.225,0.3)),
+  run_if = F) 
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_4_with_prod_pot_all_operators_in_val",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_4_with_prod_pot_all_operators_in_val",
+  train_or_test_rank = "train",
+  manually_picked_rank = 387,
+  manually_pick_graph_extents = list(xlim = c(375, 400), ylim = c(0.28,0.31)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_4_with_prod_pot_all_operators_in_val",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  SAMPTYPE = "swor",
+  retrain_main_model = T,
+  train_quantile_regression_model = F,
+  build_out_of_train_predictions = FALSE,
+  build_shapley_object = T,
+  run_shap_on_train = T,
+  number_shaps_to_calc = 1000,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_4_with_prod_pot_all_operators_in_val/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(### takes 5 hours on zbook
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_4_with_prod_pot_all_operators_in_val/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_4_with_prod_pot_all_operators_in_val/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_4_with_prod_pot_all_operators_in_val/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_4_with_prod_pot_all_operators_in_val/", 
+  quantile_predictions_locn = "../10_modeling/run_4_with_prod_pot_all_operators_in_val/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+################################################
+### build model 5
+### MRO only in train & test, 2019+ in val, 2018- in train
+### no PP vars
+dir.create("../10_modeling/run_5_no_PP_MRO_only_train_test", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_5_no_PP_MRO_only_train_test",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 1,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_5_no_PP_MRO_only_train_test",
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  manually_picked_size = 16,
+  manually_pick_graph_extents = list(xlim = c(0, 20), ylim = c(0.175,0.25)),
+  run_if = F) 
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_5_no_PP_MRO_only_train_test",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_5_no_PP_MRO_only_train_test",
+  train_or_test_rank = "train",
+  manually_picked_rank = 159,
+  manually_pick_graph_extents = list(xlim = c(150, 175), ylim = c(0.175,0.225)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_5_no_PP_MRO_only_train_test",
+  SAMPTYPE = "swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = TRUE,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = FALSE,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_5_no_PP_MRO_only_train_test/",
+                          run_if = F)
+
+quantile_predict_on_inference_data(### takes 5 hours on zbook
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_5_no_PP_MRO_only_train_test/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_5_no_PP_MRO_only_train_test/",
+  run_if = F)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_5_no_PP_MRO_only_train_test/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_5_no_PP_MRO_only_train_test/", 
+  quantile_predictions_locn = "../10_modeling/run_5_no_PP_MRO_only_train_test/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+################################################
+### build model 6
+### MRO only in train & test, 2019+ in val, 2018- in train
+### no PP vars, no DPL
+dir.create("../10_modeling/run_6_exclude_DPL_variables", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_6_exclude_DPL_variables",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 4,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_6_exclude_DPL_variables",
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  #manually_picked_size = 9,
+  manually_pick_graph_extents = list(xlim = c(0, 20), ylim = c(0.175,0.25)),
+  run_if = F)
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_6_exclude_DPL_variables",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_6_exclude_DPL_variables",
+  train_or_test_rank = "train",
+  manually_picked_rank = 213,
+  manually_pick_graph_extents = list(xlim = c(210, 215), ylim = c(0.21,0.23)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_6_exclude_DPL_variables",
+  SAMPTYPE = "swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = TRUE,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = F,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_6_exclude_DPL_variables/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(### takes 5 hours on zbook
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_6_exclude_DPL_variables/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_6_exclude_DPL_variables/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_6_exclude_DPL_variables/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_6_exclude_DPL_variables/", 
+  quantile_predictions_locn = "../10_modeling/run_6_exclude_DPL_variables/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+################################################
+### build model 7
+### MRO only in train & test, 2019+ in val, 2018- in train
+### with PP vars
+dir.create("../10_modeling/run_7_with_prod_potential_MRO_only_train_test", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 2,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test",
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  manually_picked_size = 19,
+  manually_pick_graph_extents = list(xlim = c(0, 50), ylim = c(0.12,0.25)),
+  run_if = F) 
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test",
+  train_or_test_rank = "train",
+  manually_picked_rank = 155,
+  manually_pick_graph_extents = list(xlim = c(150, 160), ylim = c(0.16,0.19)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test",
+  SAMPTYPE = "swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = TRUE,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = F,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(### takes 5 hours on zbook
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test/",
+  run_if = F)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test/", 
+  quantile_predictions_locn = "../10_modeling/run_7_with_prod_potential_MRO_only_train_test/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+################################################
+### build model 8
+### all operators, only spacing variables in model
+dir.create("../10_modeling/run_8_all_opers_spacing_vars_only", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_8_all_opers_spacing_vars_only",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 3,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_8_all_opers_spacing_vars_only",
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  manually_picked_size = 16,
+  manually_pick_graph_extents = list(xlim = c(0, 20), ylim = c(0.25,0.35)),
+  run_if = F)
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_8_all_opers_spacing_vars_only",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_8_all_opers_spacing_vars_only",
+  train_or_test_rank = "train",
+  manually_picked_rank = 387,
+  manually_pick_graph_extents = list(xlim = c(360, 400), ylim = c(0.3,0.35)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_8_all_opers_spacing_vars_only",
+  SAMPTYPE = "swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = T,
+  train_quantile_regression_model = F,
+  build_out_of_train_predictions = FALSE,
+  build_shapley_object = T,
+  run_shap_on_train = T,
+  number_shaps_to_calc = 1000,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_8_all_opers_spacing_vars_only/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(### takes 5 hours on zbook
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_8_all_opers_spacing_vars_only/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_8_all_opers_spacing_vars_only/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_8_all_opers_spacing_vars_only/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_8_all_opers_spacing_vars_only/", 
+  quantile_predictions_locn = "../10_modeling/run_8_all_opers_spacing_vars_only/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+create_final_GCM(
+  rfsrc_model_locn = "../10_modeling/run_8_all_opers_spacing_vars_only/final_model.rds",
+  output_locn = "../10_modeling/run_8_all_opers_spacing_vars_only/",
+  parent_data_config_locn = "config_files/final_GCM_parent_assumptions.xlsx",
+  run_if = F)
+
+################################################
+### build model 9
+### MRO only, only spacing variables in model
+dir.create("../10_modeling/run_9_MRO_only_spacing_vars_only", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 3,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_9_MRO_only_spacing_vars_only",
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  manually_picked_size = 5,
+  manually_pick_graph_extents = list(xlim = c(0, 10), ylim = c(0.175,0.3)),
+  run_if = F)
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only",
+  train_or_test_rank = "train",
+  manually_picked_rank = 200,
+  manually_pick_graph_extents = list(xlim = c(195, 210), ylim = c(0.2,0.3)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only",
+  SAMPTYPE = "swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = TRUE,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = F,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(### takes 5 hours on zbook
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_9_MRO_only_spacing_vars_only/", 
+  quantile_predictions_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+create_final_GCM(
+  sample_inference_data_locn = "../11_inference_data_sets/BASE_PLAN_sensitivity.csv",
+  rfsrc_model_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only/final_model.rds",
+  old_GCM_locn = "../9_GCM/GCM_2_with_depln.csv",
+  output_locn = "../10_modeling/run_9_MRO_only_spacing_vars_only/",
+  parent_data_config_locn = "config_files/final_GCM_parent_assumptions.xlsx",
+  run_if = FALSE)
+
+################################################
+### model 10- predict high holdout all operators, no PP
+dir.create("../10_modeling/run_10_all_operators_max_prediction", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2b_GCM_test_output_columns_maxed.csv",
+  output_folder_locn = "../10_modeling/run_10_all_operators_max_prediction",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 1,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_10_all_operators_max_prediction",
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2b_GCM_test_output_columns_maxed.csv",
+  # manually_picked_size = 12,
+  manually_pick_graph_extents = list(xlim = c(0, 20), ylim = c(0.99825,0.9985)),
+  run_if = F)
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/2b_GCM_test_output_columns_maxed.csv",
+  model_folder_locn = "../10_modeling/run_10_all_operators_max_prediction",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_10_all_operators_max_prediction",
+  train_or_test_rank = "train",
+  manually_picked_rank = 281,
+  manually_pick_graph_extents = list(xlim = c(280, 285), ylim = c(0.99825, 0.9983)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_10_all_operators_max_prediction",
+  SAMPTYPE = "swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = TRUE,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = F,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_10_all_operators_max_prediction/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_10_all_operators_max_prediction/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_10_all_operators_max_prediction/",
+  run_if = F)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_10_all_operators_max_prediction/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_10_all_operators_max_prediction/", 
+  quantile_predictions_locn = "../10_modeling/run_10_all_operators_max_prediction/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+################################################
+### model 11- predict high holdout MRO only, no PP
+### because MG's model is optimistic
+dir.create("../10_modeling/run_11_MRO_only_max_prediction", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3b_GCM_test_output_columns_maxed.csv",
+  output_folder_locn = "../10_modeling/run_11_MRO_only_max_prediction",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 1,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_11_MRO_only_max_prediction",
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3b_GCM_test_output_columns_maxed.csv",
+  # manually_picked_size = 12,
+  manually_pick_graph_extents = list(xlim = c(0, 10), ylim = c(0.998,0.9982)),
+  run_if = F)
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/3b_GCM_test_output_columns_maxed.csv",
+  model_folder_locn = "../10_modeling/run_11_MRO_only_max_prediction",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_11_MRO_only_max_prediction",
+  train_or_test_rank = "test",
+  manually_picked_rank = 300,
+  manually_pick_graph_extents = list(xlim = c(260, 270), ylim = c(0.997,0.998)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_11_MRO_only_max_prediction",
+  SAMPTYPE = "swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = TRUE,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = F,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_11_MRO_only_max_prediction/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_11_MRO_only_max_prediction/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_11_MRO_only_max_prediction/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_11_MRO_only_max_prediction/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_11_MRO_only_max_prediction/", 
+  quantile_predictions_locn = "../10_modeling/run_11_MRO_only_max_prediction/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+################################################
+### model 12- tune on spacing pilots, no PP
+dir.create("../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/2c_spacing_analogs_holdout_train.csv",
+  test_data_locn = "../8_train_test_full_datasets/2c_spacing_analogs_holdout_test.csv",
+  output_folder_locn = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 1,
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots",
+  train_data_locn = "../8_train_test_full_datasets/2c_spacing_analogs_holdout_train.csv",
+  test_data_locn = "../8_train_test_full_datasets/2c_spacing_analogs_holdout_test.csv",
+  # manually_picked_size = 12,
+  manually_pick_graph_extents = list(xlim = c(0, 20), ylim = c(0.2, 0.35)),
+  run_if = F)
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/2c_spacing_analogs_holdout_train.csv",
+  test_data_locn = "../8_train_test_full_datasets/2c_spacing_analogs_holdout_test.csv",
+  model_folder_locn = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots",
+  train_or_test_rank = "train",
+  manually_picked_rank = 152,
+  manually_pick_graph_extents = list(xlim = c(150, 155), ylim = c(0.2,0.25)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/2_all_operators_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots",
+  SAMPTYPE = "swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = TRUE,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = F,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots/", 
+  quantile_predictions_locn = "../10_modeling/run_12_all_opers_holdout_MRO_spacing_pilots/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+################################################
+### model 13- tune on spacing pilots, MRO only, no PP
+dir.create("../10_modeling/run_13_model_12_MRO_only", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/3c_MRO_ONLY_spacing_analogs_holdout_train.csv",
+  test_data_locn = "../8_train_test_full_datasets/2c_spacing_analogs_holdout_test.csv",
+  output_folder_locn = "../10_modeling/run_13_model_12_MRO_only",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  model_iteration = 1,
+  run_if = F)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_13_model_12_MRO_only",
+  train_data_locn = "../8_train_test_full_datasets/3c_MRO_ONLY_spacing_analogs_holdout_train.csv",
+  test_data_locn = "../8_train_test_full_datasets/2c_spacing_analogs_holdout_test.csv",
+  manually_picked_size = 8,
+  manually_pick_graph_extents = list(xlim = c(0, 20), ylim = c(0.15, 0.25)),
+  run_if = F)
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/3c_MRO_ONLY_spacing_analogs_holdout_train.csv",
+  test_data_locn = "../8_train_test_full_datasets/2c_spacing_analogs_holdout_test.csv",
+  model_folder_locn = "../10_modeling/run_13_model_12_MRO_only",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_360", "LIQUID_720"),
+  run_if = FALSE)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_13_model_12_MRO_only",
+  train_or_test_rank = "train",
+  manually_picked_rank = 200,
+  manually_pick_graph_extents = list(xlim = c(185, 215), ylim = c(0.175,0.225)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/3_MRO_ONLY_ALL_2019_later_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_13_model_12_MRO_only",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  SAMPTYPE = "swor",
+  retrain_main_model = F,
+  train_quantile_regression_model = FALSE,
+  build_out_of_train_predictions = FALSE,
+  build_shapley_object = T,
+  run_shap_on_train = T,
+  number_shaps_to_calc = 100,
+  run_if = F)
+
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_13_model_12_MRO_only/",
+                          run_if = FALSE)
+
+quantile_predict_on_inference_data(
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_13_model_12_MRO_only/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_13_model_12_MRO_only/",
+  run_if = FALSE)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_13_model_12_MRO_only/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_13_model_12_MRO_only/", 
+  quantile_predictions_locn = "../10_modeling/run_13_model_12_MRO_only/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+################################################
+### model 14- tune on MRO redev wells, no PP
+dir.create("../10_modeling/run_14_val_on_MRO_redev", showWarnings = FALSE)
+
+build_predictive_model.setup_and_run_rfe(
+  train_data_locn = "../8_train_test_full_datasets/4_MRO_redevs_in_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/4_MRO_redevs_in_val_test_add_GCM.csv",
+  output_folder_locn = "../10_modeling/run_14_val_on_MRO_redev",
+  config_file_locn = "config_files/5_columns_to_train_with.xlsx",
+  target_variables = c("LIQUID_150", "LIQUID_180"),
+  model_iteration = 1, # for no PP columns
+  run_if = FALSE)
+
+build_predictive_model.view_rfe_results(
+  rfe_results_location = "../10_modeling/run_14_val_on_MRO_redev",
+  train_data_locn = "../8_train_test_full_datasets/4_MRO_redevs_in_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/4_MRO_redevs_in_val_test_add_GCM.csv",
+  # manually_picked_size = 12,
+  manually_pick_graph_extents = list(xlim = c(0, 20), ylim = c(0.15, 0.35)),
+  run_if = F)
+
+build_predictive_model.tune_hyperparameters(
+  train_data_locn = "../8_train_test_full_datasets/4_MRO_redevs_in_val_train_add_GCM.csv",
+  test_data_locn = "../8_train_test_full_datasets/4_MRO_redevs_in_val_test_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_14_val_on_MRO_redev",
+  mtry_try_in = c(3, 5, 7, 9),
+  min.node.size_try_in = c(1, 5, 10, 20, 30, 50, 100),
+  num_trees_try_in = c(100, 300, 500, 1000),
+  sample.fraction_try_in = c(0.5, 0.6, 0.7, 1),
+  target_variables = c("LIQUID_150", "LIQUID_180"),
+  run_if = F)
+
+build_predictive_model.pick_hyperparameters_results(
+  model_folder_locn = "../10_modeling/run_14_val_on_MRO_redev",
+  train_or_test_rank = "test",
+  manually_picked_rank = 369,
+  manually_pick_graph_extents = list(xlim = c(365, 370), ylim = c(0.2,0.3)),
+  run_if = F)
+
+build_predictive_model.train_final_model(
+  train_data_locn = "../8_train_test_full_datasets/4_MRO_redevs_in_val_whole_add_GCM.csv",
+  model_folder_locn = "../10_modeling/run_14_val_on_MRO_redev",
+  SAMPTYPE = "swor",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  retrain_main_model = F,
+  train_quantile_regression_model = F,
+  build_out_of_train_predictions = F,
+  build_shapley_object = T,
+  run_shap_on_train = T,
+  number_shaps_to_calc = 1500,
+  run_if = F)
+
+predict_on_inference_data(inference_data_locns = MRO_only_inference_data_locns,
+                          output_and_rfsrc_model_locn = "../10_modeling/run_14_val_on_MRO_redev/",
+                          run_if = F)
+
+quantile_predict_on_inference_data(
+  inference_data_locns = MRO_only_inference_data_locns,
+  quantile_models_locn = "../10_modeling/run_14_val_on_MRO_redev/quantile_regression_models/",
+  number_iters_to_run = 50L,
+  output_locn = "../10_modeling/run_14_val_on_MRO_redev/",
+  run_if = F)
+
+bandaid_quantile_predictions_with_factor(
+  quantile_prediction_csv_locn = "../10_modeling/run_14_val_on_MRO_redev/quantile_predictions_2_final.csv",
+  quantile_stretch_factor = 1.2,
+  run_if = F)
+
+build_final_data_sets_with_predictions(
+  base_predictions_folder = "../10_modeling/run_14_val_on_MRO_redev/", 
+  quantile_predictions_locn = "../10_modeling/run_14_val_on_MRO_redev/quantile_predictions_2_final.csv",
+  bandaid_in_procount_prod = TRUE,
+  run_if = F)
+
+########################################
+### stacked model 1
+
+dir.create("../10_modeling/stacked_model", showWarnings = FALSE)
+
+model_folder_locns = c(
+  "run_1_swor",
+  "run_2_with_prod_potential",
+  "run_3_no_prod_pot_all_operators_in_val",
+  "run_4_with_prod_pot_all_operators_in_val",
+  "run_5_no_PP_MRO_only_train_test",
+  "run_6_exclude_DPL_variables",
+  "run_7_with_prod_potential_MRO_only_train_test",
+  "run_8_all_opers_spacing_vars_only",
+  "run_9_MRO_only_spacing_vars_only",
+  "run_10_all_operators_max_prediction",
+  "run_11_MRO_only_max_prediction",
+  "run_12_all_opers_holdout_MRO_spacing_pilots",
+  "run_13_model_12_MRO_only",
+  "run_14_val_on_MRO_redev")
+
+stacked_model_train(
+  model_folder_locns = model_folder_locns,
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  input_variables = 
+    c("LIQUID_30", "LIQUID_90", "LIQUID_180", "LIQUID_360",
+      "LIQUID_720", "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  run_if = F)
+
+stacked_model_predict(
+  model_folder_locns = model_folder_locns,
+  input_variables = 
+    c("LIQUID_30", "LIQUID_90", "LIQUID_180", "LIQUID_360",
+      "LIQUID_720", "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  run_if = F)
+
+combine_stack_and_MG_predictions(
+  model_folder_locns = model_folder_locns,
+  run_if = F)
+
+########################################
+### stacked model 2 with spacing sensitivities
+
+dir.create("../10_modeling/stacked_model_2_spacing", showWarnings = FALSE)
+
+model_folder_locns = c(
+  "run_1_swor",
+  "run_2_with_prod_potential",
+  "run_3_no_prod_pot_all_operators_in_val",
+  "run_4_with_prod_pot_all_operators_in_val",
+  "run_5_no_PP_MRO_only_train_test",
+  "run_6_exclude_DPL_variables",
+  "run_7_with_prod_potential_MRO_only_train_test",
+  "run_8_all_opers_spacing_vars_only",
+  "run_9_MRO_only_spacing_vars_only",
+  "run_10_all_operators_max_prediction",
+  "run_11_MRO_only_max_prediction",
+  "run_12_all_opers_holdout_MRO_spacing_pilots",
+  "run_13_model_12_MRO_only",
+  "run_14_val_on_MRO_redev")
+
+stacked_model_train(
+  model_folder_locns = model_folder_locns,
+  stack_model_folder_locn = "stacked_model_2_spacing",
+  target_variables = c("LIQUID_30", "LIQUID_60", "LIQUID_90", "LIQUID_120", 
+                       "LIQUID_150", "LIQUID_180", "LIQUID_210", "LIQUID_240", 
+                       "LIQUID_270", "LIQUID_300", "LIQUID_330", "LIQUID_360", 
+                       "LIQUID_390", "LIQUID_420", "LIQUID_450", "LIQUID_480", 
+                       "LIQUID_510", "LIQUID_540", "LIQUID_570", "LIQUID_600",
+                       "LIQUID_630", "LIQUID_660", "LIQUID_690", "LIQUID_720",
+                       "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  input_variables = 
+    c("LIQUID_30", "LIQUID_90", "LIQUID_180", "LIQUID_360",
+      "LIQUID_720", "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  run_if = F)
+
+stacked_model_predict(
+  model_folder_locns = model_folder_locns,
+  stack_model_folder_locn = "stacked_model_2_spacing",
+  input_variables = 
+    c("LIQUID_30", "LIQUID_90", "LIQUID_180", "LIQUID_360",
+      "LIQUID_720", "LIQUID_1080", "LIQUID_1800",	"LIQUID_3600", "LIQUID_7200", "LIQUID_14400"),
+  run_if = F)
+
+combine_stack_and_MG_predictions(
+  model_folder_locns = model_folder_locns,
+  stack_model_folder_locn = "stacked_model_2_spacing/",
+  MG_weight_of_whole = 0.3,
+  Mariano_data_locn = "../../../../Viewers/Data/PLAN_Output_for_maps_EAGLEFORD.csv",
+  run_if = T)
+
+```
+
+
+
+
+```{r debug}
+
+
+
+```
+
+
+
